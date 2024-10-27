@@ -2,50 +2,51 @@
 #include <stdlib.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <sys/types.h>
 #include <sys/msg.h>
 #include <unistd.h>
+#include <time.h>
 
-// Structure for the Clock (Shared Memory)
-struct Clock {
-    int seconds;
-    int nanoseconds;
-};
-
-// Structure for Message Buffer (Message Queue)
+// Message structure for communication
 struct msg_buffer {
-    long msg_type; 
-    int msg_data;  
+    long msg_type;
+    int msg_data;
 };
 
 int main(int argc, char *argv[]) {
-    // Message queue ID and message buffer
-    int msgid;
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <msgid>\n", argv[0]);
+        exit(1);
+    }
+
+    int msgid = atoi(argv[1]);
     struct msg_buffer msg;
+    srand(getpid());  // Seed random with unique PID for different processes
 
-    // Get message queue ID (this will be passed in as a parameter)
-    msgid = atoi(argv[1]);
-
-    // Loop simulating worker process behavior
     while (1) {
-        // Receive a message from oss (blocking until received)
+        // Receive the time quantum from oss
         msgrcv(msgid, &msg, sizeof(msg.msg_data), 1, 0);
-        printf("Worker PID %d: Received message with data %d\n", getpid(), msg.msg_data);
+        int time_slice = msg.msg_data;
+        printf("Worker PID %d: Received time slice of %d nanoseconds\n", getpid(), time_slice);
 
-        // If the message data is 0, terminate the worker
-        if (msg.msg_data == 0) {
-            printf("Worker PID %d: Terminating.\n", getpid());
-            break;
-        }
+        // Use full or partial time slice
+        int use_time = (rand() % 100 < 70) ? time_slice : (time_slice * (rand() % 50 + 1) / 100);  // Use 50-100% of slice
+        int blocked = (use_time < time_slice) ? 1 : 0;
 
-        // Simulate doing work (for now, just sleep for a short time)
-        usleep(100000);  // Sleep for 100ms (simulated work)
-
-        // Send a message back to oss with data indicating work done
+        // Send back the time used
         msg.msg_type = 1;
-        msg.msg_data = 1;  // Simulate completion of work
+        msg.msg_data = blocked ? -use_time : use_time;  
         msgsnd(msgid, &msg, sizeof(msg.msg_data), 0);
-        printf("Worker PID %d: Sent message back to OSS.\n", getpid());
+
+        if (blocked) {
+            printf("Worker PID %d: Blocked with %d ns used. Waiting for OSS to unblock.\n", getpid(), use_time);
+            msgrcv(msgid, &msg, sizeof(msg.msg_data), getpid(), 0);  
+            if (msg.msg_data == 0) {  
+                printf("Worker PID %d: Terminating.\n", getpid());
+                break;
+            }
+        } else if (use_time == time_slice) {
+            printf("Worker PID %d: Used entire time slice.\n", getpid());
+        }
     }
 
     return 0;
