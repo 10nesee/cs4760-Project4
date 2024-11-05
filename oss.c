@@ -7,59 +7,88 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <string.h>
+#include <errno.h>
 
-#define MAX_PROCESSES 18
-#define REAL_TIME_LIMIT 3  
+#define MAX_PROCESSES 18  // Max number of processes allowed
+#define REAL_TIME_LIMIT 3  // Real-world time limit in seconds
 
-// Simulated system clock
+// Shared clock to track simulated system time
 struct Clock {
     int seconds;
     int nanoseconds;
 };
 
-// Process Control Block (PCB) structure
+// Process Control Block (PCB) to store process-related data
 struct PCB {
     int occupied;
     pid_t pid;
-    int startSeconds;
-    int startNano;
-    int serviceTimeSeconds;
-    int serviceTimeNano;
-    int blocked;
-    int cpuTimeSeconds;    // Total CPU time in seconds
-    int cpuTimeNano;       // Total CPU time in nanoseconds
-    int waitTimeSeconds;   // Total wait time in seconds
-    int waitTimeNano;      // Total wait time in nanoseconds
+    int startSeconds, startNano; // Start time for each process
+    int serviceTimeSeconds, serviceTimeNano; // Time spent being serviced
+    int cpuTimeSeconds, cpuTimeNano; // Total CPU time used
+    int waitTimeSeconds, waitTimeNano; // Total time spent waiting
 };
 
-// PCB Table and Queues
-struct PCB processTable[MAX_PROCESSES];
-int readyQueue[MAX_PROCESSES], readyFront = 0, readyRear = 0;
-
+// Message structure for communication between oss and workers
 struct msg_buffer {
     long msg_type;
     int msg_data;
 };
 
+// Global Variables
+struct PCB processTable[MAX_PROCESSES];
+int readyQueue[MAX_PROCESSES], readyFront = 0, readyRear = 0;
+int shmid, msgid;   
+struct Clock *shm_clock; 
+FILE *logfile;
+
+// Function Prototypes
+void enqueue(int queue[], int *rear, int pcbIndex);
+int dequeue(int queue[], int *front);
+double calculate_priority_ratio(struct PCB *pcb, struct Clock *clock);
+void increment_clock(struct Clock *clock, int ns);
+void add_time(int *seconds, int *nanoseconds, int add_ns);
+void log_process_table();
+void cleanup(int signo);
+void setup_signal_handlers();
+void create_process(int pcbIndex);
+void terminate_on_timeout(int signo);
+
+// Set up signal handlers to cleanup on exit
+void setup_signal_handlers() {
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
+    signal(SIGALRM, terminate_on_timeout);
+    alarm(REAL_TIME_LIMIT * 2);  
+}
+
+// Handler for when the program times out
+void terminate_on_timeout(int signo) {
+    fprintf(stderr, "Timeout reached. Terminating simulation.\n");
+    cleanup(signo);
+}
+
+// Adds a process to the ready queue
 void enqueue(int queue[], int *rear, int pcbIndex) {
     queue[*rear] = pcbIndex;
     *rear = (*rear + 1) % MAX_PROCESSES;
 }
 
+// Removes a process from the ready queue
 int dequeue(int queue[], int *front) {
     int pcbIndex = queue[*front];
     *front = (*front + 1) % MAX_PROCESSES;
     return pcbIndex;
 }
 
-// Calculate priority ratio
+// Calculates priority for a process
 double calculate_priority_ratio(struct PCB *pcb, struct Clock *clock) {
     double serviceTime = pcb->serviceTimeSeconds + pcb->serviceTimeNano / 1e9;
     double timeInSystem = (clock->seconds - pcb->startSeconds) + (clock->nanoseconds - pcb->startNano) / 1e9;
     return timeInSystem == 0 ? 0 : serviceTime / timeInSystem;
 }
 
-// Increment clock time
+// Increment the clock
 void increment_clock(struct Clock *clock, int ns) {
     clock->nanoseconds += ns;
     while (clock->nanoseconds >= 1000000000) {
@@ -68,7 +97,7 @@ void increment_clock(struct Clock *clock, int ns) {
     }
 }
 
-// Add time with overflow adjustment
+// Adds time and manages overflow 
 void add_time(int *seconds, int *nanoseconds, int add_ns) {
     *nanoseconds += add_ns;
     if (*nanoseconds >= 1000000000) {
@@ -77,130 +106,147 @@ void add_time(int *seconds, int *nanoseconds, int add_ns) {
     }
 }
 
-int main() {
-    int shmid = shmget(IPC_PRIVATE, sizeof(struct Clock), IPC_CREAT | 0666);
-    struct Clock *shm_clock = (struct Clock *)shmat(shmid, NULL, 0);
-    shm_clock->seconds = shm_clock->nanoseconds = 0;
+// Cleans up shared memory, message queues, and child processes
+void cleanup(int signo) {
+    shmdt(shm_clock);  // Detach shared memory
+    shmctl(shmid, IPC_RMID, NULL);  // Destroy shared memory
+    msgctl(msgid, IPC_RMID, NULL);  // Destroy message queue
 
-    int msgid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
-
-    // Clearmessages in the queue at the start
-    struct msg_buffer msg_clear;
-    while (msgrcv(msgid, &msg_clear, sizeof(msg_clear.msg_data), 0, IPC_NOWAIT) != -1) {
-        // Continue receiving until queue is empty
-    }
-
-    // Record start time
-    time_t start_time = time(NULL);
-
-    // Initialize PCB table and fork workers
-    for (int i = 0; i < MAX_PROCESSES; i++) processTable[i].occupied = 0;
-
+    // Kill active process
     for (int i = 0; i < MAX_PROCESSES; i++) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            char msgid_str[10];
-            sprintf(msgid_str, "%d", msgid);
-            execlp("./worker", "worker", msgid_str, (char *)NULL);
-            exit(1);
-        } else {
-            for (int j = 0; j < MAX_PROCESSES; j++) {
-                if (!processTable[j].occupied) {
-                    processTable[j].occupied = 1;
-                    processTable[j].pid = pid;
-                    enqueue(readyQueue, &readyRear, j);
-                    break;
-                }
-            }
+        if (processTable[i].occupied) {
+            kill(processTable[i].pid, SIGTERM);
+            waitpid(processTable[i].pid, NULL, 0);
         }
     }
 
-    // Main scheduling loop
-    while (readyFront != readyRear && (time(NULL) - start_time) < REAL_TIME_LIMIT) {
+    if (logfile) fclose(logfile);  // Close log file
+    printf("Cleanup complete. Exiting.\n");
+    exit(0);
+}
+
+// Logs to file
+void log_process_table() {
+    fprintf(logfile, "Current system time: %d:%d\n", shm_clock->seconds, shm_clock->nanoseconds);
+    fprintf(logfile, "Process Table:\n");
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (processTable[i].occupied) {
+            fprintf(logfile, "PID %d - CPU Time: %d s %d ns, Wait Time: %d s %d ns\n",
+                    processTable[i].pid,
+                    processTable[i].cpuTimeSeconds, processTable[i].cpuTimeNano,
+                    processTable[i].waitTimeSeconds, processTable[i].waitTimeNano);
+        }
+    }
+    fflush(logfile);
+}
+
+// Create worker process and adds it to the process table
+void create_process(int pcbIndex) {
+    pid_t pid = fork();
+    if (pid == 0) {  // Child
+        char msgid_str[10];
+        sprintf(msgid_str, "%d", msgid);
+        execlp("./worker", "worker", msgid_str, NULL);
+        perror("execlp failed");
+        exit(1);  
+    } else {  // Parent
+        processTable[pcbIndex].occupied = 1;
+        processTable[pcbIndex].pid = pid;
+        processTable[pcbIndex].startSeconds = shm_clock->seconds;
+        processTable[pcbIndex].startNano = shm_clock->nanoseconds;
+        enqueue(readyQueue, &readyRear, pcbIndex);
+    }
+}
+
+// Main simulation loop
+int main(int argc, char *argv[]) {
+    setup_signal_handlers();
+    logfile = fopen("test_log.txt", "w");
+
+    // Setup shared memory for the system clock
+    shmid = shmget(IPC_PRIVATE, sizeof(struct Clock), IPC_CREAT | 0666);
+    shm_clock = (struct Clock *)shmat(shmid, NULL, 0);
+    shm_clock->seconds = shm_clock->nanoseconds = 0;
+
+    // Setup message queue for IPC
+    msgid = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+
+    // Initialize process table
+    for (int i = 0; i < MAX_PROCESSES; i++) processTable[i].occupied = 0;
+
+    // Limits for testing
+    int maxProcesses = 3;
+    int maxSimultaneousProcesses = 2;
+    int totalChildrenLaunched = 0, currentChildren = 0;
+    int launchAllowed = 1;
+
+    time_t start_time = time(NULL);
+
+    // Main loop for managing process scheduling
+    while ((totalChildrenLaunched < maxProcesses || currentChildren > 0)) {
+        if ((time(NULL) - start_time) >= REAL_TIME_LIMIT) {
+            launchAllowed = 0;
+            printf("Real-time limit reached. No new processes will be launched.\n");
+        }
+
+        if (launchAllowed && totalChildrenLaunched < maxProcesses && currentChildren < maxSimultaneousProcesses) {
+            create_process(totalChildrenLaunched++);
+            currentChildren++;
+        }
+
         int highestPriorityIndex = -1;
         double minRatio = __DBL_MAX__;
-
-        // Determine the highest priority process
         for (int i = readyFront; i != readyRear; i = (i + 1) % MAX_PROCESSES) {
             int pcbIndex = readyQueue[i];
             struct PCB *pcb = &processTable[pcbIndex];
-            double ratio = calculate_priority_ratio(pcb, shm_clock);
 
+            pcb->serviceTimeNano += 10000;
+            add_time(&pcb->serviceTimeSeconds, &pcb->serviceTimeNano, 0);
+
+            double ratio = calculate_priority_ratio(pcb, shm_clock);
             if (ratio < minRatio) {
                 minRatio = ratio;
-                highestPriorityIndex = i;
+                highestPriorityIndex = pcbIndex;
             }
         }
 
-        // Schedule the highest priority process
         if (highestPriorityIndex != -1) {
-            int pcbIndex = dequeue(readyQueue, &readyFront);
+            int pcbIndex = highestPriorityIndex;
+            dequeue(readyQueue, &readyFront);
             struct PCB *pcb = &processTable[pcbIndex];
-
-            // Update wait time before scheduling
-            add_time(&pcb->waitTimeSeconds, &pcb->waitTimeNano, 50000000);  
-
-            // Reinitialize and set message data to 50ms time slice
             struct msg_buffer msg;
-            msg.msg_type = 1;
-            msg.msg_data = 50000000;  
-            msgsnd(msgid, &msg, sizeof(msg.msg_data), 0);
+            msg.msg_type = pcb->pid;
+            msg.msg_data = 50000000;
+            if (msgsnd(msgid, &msg, sizeof(msg.msg_data), 0) == -1) {
+                perror("msgsnd to worker failed");
+                exit(1);
+            }
 
-            // Wait for response and update clock and CPU time
-            msgrcv(msgid, &msg, sizeof(msg.msg_data), 1, 0);
+            if (msgrcv(msgid, &msg, sizeof(msg.msg_data), 1, 0) == -1) {
+                perror("msgrcv from worker failed");
+                exit(1);
+            }
 
-            int time_used = abs(msg.msg_data);  
-            increment_clock(shm_clock, time_used);
-            add_time(&pcb->cpuTimeSeconds, &pcb->cpuTimeNano, time_used);
+            increment_clock(shm_clock, abs(msg.msg_data));
+            add_time(&pcb->cpuTimeSeconds, &pcb->cpuTimeNano, abs(msg.msg_data));
 
-            // Re-enqueue or remove process based on response
             if (msg.msg_data > 0) {
                 enqueue(readyQueue, &readyRear, pcbIndex);
             } else {
                 waitpid(pcb->pid, NULL, 0);
                 pcb->occupied = 0;
+                currentChildren--;
             }
         }
-    }
 
-    // Calculate and print statistics
-    int totalCpuSeconds = 0, totalCpuNano = 0;
-    int totalWaitSeconds = 0, totalWaitNano = 0;
-    int totalProcesses = 0;
-
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        if (processTable[i].occupied == 0) {  // Only include completed processes
-            totalCpuSeconds += processTable[i].cpuTimeSeconds;
-            totalCpuNano += processTable[i].cpuTimeNano;
-            add_time(&totalCpuSeconds, &totalCpuNano, 0);
-
-            totalWaitSeconds += processTable[i].waitTimeSeconds;
-            totalWaitNano += processTable[i].waitTimeNano;
-            add_time(&totalWaitSeconds, &totalWaitNano, 0);
-
-            totalProcesses++;
+        if (!launchAllowed && totalChildrenLaunched >= maxProcesses && currentChildren == 0) {
+            printf("All processes completed. Terminating simulation.\n");
+            break;
         }
     }
 
-    // Calculate CPU utilization
-    double cpuUtilization = ((double)totalCpuSeconds + totalCpuNano / 1e9) /
-                            ((double)shm_clock->seconds + shm_clock->nanoseconds / 1e9) * 100;
-
-    // Calculate average wait time
-    double avgWaitTime = ((double)totalWaitSeconds + totalWaitNano / 1e9) / totalProcesses;
-
-    printf("Simulation Statistics:\n");
-    printf("CPU Utilization: %.2f%%\n", cpuUtilization);
-    printf("Average Wait Time: %.6f seconds\n", avgWaitTime);
-    printf("Total Processes Completed: %d\n", totalProcesses);
-
-    // Cleanup code
-    shmdt(shm_clock);
-    shmctl(shmid, IPC_RMID, NULL);
-    msgctl(msgid, IPC_RMID, NULL);
-
-    printf("OSS: Simulation completed.\n");
-
+    fclose(logfile);
+    cleanup(0);
     return 0;
 }
 
